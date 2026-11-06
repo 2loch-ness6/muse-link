@@ -43,6 +43,7 @@ PROTOCOL_VERSION = "1"
 # undeclared urllib default agent is both unidentifiable and a common
 # bot-filter casualty. A closed network should say who it is.
 USER_AGENT = "muse-link/1 (Muse-Link pilot client)"
+VERSION = "0.2.0"
 
 
 def iso_now():
@@ -654,6 +655,8 @@ def main():
     ap = argparse.ArgumentParser(prog="muse-link", description="Muse-Link client")
     ap.add_argument("--home", default=os.environ.get(
         "MUSELINK_HOME", os.path.expanduser("~/.muse-link")))
+    ap.add_argument("--version", action="version",
+                    version="muse-link " + VERSION)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     r = sub.add_parser("register")
