@@ -110,36 +110,56 @@ class Client:
                 f"owner={c['identity']['owner_name']} fp={c['fingerprint']}")
 
     # ---- HTTP -------------------------------------------------------------
+    # Issue #2: urllib flows through this environment's egress proxy are
+    # forcibly terminated mid-body at a high rate (IncompleteRead,
+    # RemoteDisconnected) even though the relay and the path are healthy.
+    # Retry transient network failures with the identical request bytes:
+    # fetch, ack, and agents are idempotent, and send reuses the one
+    # signed blob built by its caller, which the relay dedupes by
+    # message ID, so a retry cannot duplicate a delivery. HTTP error
+    # statuses are real responses, not network failures, and are
+    # returned to the caller without retrying.
+    _RETRY_DELAYS = (0.5, 1.0, 2.0)
+
     def http_get(self, path):
-        req = urllib.request.Request(
-            self.relay + path, method="GET",
-            headers={"User-Agent": USER_AGENT})
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return resp.status, dict(resp.headers), resp.read()
-        except urllib.error.HTTPError as exc:
-            return exc.code, dict(exc.headers), exc.read()
-        except (urllib.error.URLError, http.client.HTTPException,
-                OSError) as exc:
-            fail("network error contacting relay (%s): %s" % (path, exc))
+        for attempt in range(len(self._RETRY_DELAYS) + 1):
+            req = urllib.request.Request(
+                self.relay + path, method="GET",
+                headers={"User-Agent": USER_AGENT})
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    return resp.status, dict(resp.headers), resp.read()
+            except urllib.error.HTTPError as exc:
+                return exc.code, dict(exc.headers), exc.read()
+            except (urllib.error.URLError, http.client.HTTPException,
+                    OSError) as exc:
+                if attempt == len(self._RETRY_DELAYS):
+                    fail("network error contacting relay (%s): %s"
+                         % (path, exc))
+                time.sleep(self._RETRY_DELAYS[attempt])
 
     def http_post(self, path, text):
-        req = urllib.request.Request(
-            self.relay + path, data=text.encode(), method="POST",
-            headers={"Content-Type": "text/plain",
-                     "User-Agent": USER_AGENT})
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return resp.status, json.loads(resp.read().decode())
-        except urllib.error.HTTPError as exc:
-            raw = exc.read().decode("utf-8", "replace")
+        data = text.encode()
+        for attempt in range(len(self._RETRY_DELAYS) + 1):
+            req = urllib.request.Request(
+                self.relay + path, data=data, method="POST",
+                headers={"Content-Type": "text/plain",
+                         "User-Agent": USER_AGENT})
             try:
-                return exc.code, json.loads(raw)
-            except ValueError:
-                return exc.code, {"error": raw}
-        except (urllib.error.URLError, http.client.HTTPException,
-                OSError) as exc:
-            fail("network error contacting relay (%s): %s" % (path, exc))
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    return resp.status, json.loads(resp.read().decode())
+            except urllib.error.HTTPError as exc:
+                raw = exc.read().decode("utf-8", "replace")
+                try:
+                    return exc.code, json.loads(raw)
+                except ValueError:
+                    return exc.code, {"error": raw}
+            except (urllib.error.URLError, http.client.HTTPException,
+                    OSError) as exc:
+                if attempt == len(self._RETRY_DELAYS):
+                    fail("network error contacting relay (%s): %s"
+                         % (path, exc))
+                time.sleep(self._RETRY_DELAYS[attempt])
 
     # ---- server key: fetched fresh, never persisted -----------------------
     def fetch_server_key(self):
