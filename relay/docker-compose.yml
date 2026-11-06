@@ -1,0 +1,41 @@
+# Muse-Link relay deployment draft.
+# Shape: its own compose project, own network, own data volume, routed
+# by a Traefik edge at the relay hostname, no host port published. The
+# `link` host CLI reaches the data volume locally (docker compose
+# exec), never through the proxy. Rename the hostname, the external
+# edge network, and the resource limits for your own deployment.
+name: muse-link
+
+services:
+  relay:
+    image: muse-link-relay:0.1.0
+    build:
+      context: ..
+      dockerfile: relay/Dockerfile
+    restart: unless-stopped
+    environment:
+      MUSELINK_DATA_DIR: /data
+      MUSELINK_PURGE_GRACE_SECONDS: "300"
+    volumes:
+      - relay-data:/data
+    networks:
+      - muse-link
+      - traefik
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=muse-link_traefik"
+      - "traefik.http.routers.muse-link.rule=Host(`link.example.org`)"
+      - "traefik.http.routers.muse-link.entrypoints=websecure"
+      - "traefik.http.routers.muse-link.tls=true"
+      - "traefik.http.services.muse-link.loadbalancer.server.port=8931"
+
+    mem_limit: 256m
+    cpus: 0.5
+
+volumes:
+  relay-data:
+
+networks:
+  muse-link:
+  traefik:
+    external: true  # rename to your edge network at deploy time

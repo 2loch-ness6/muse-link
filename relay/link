@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""link: Muse-Link operator host CLI.
+
+Runs on the relay host and operates directly on the relay data dir
+(in deployment: the relay container's data volume, reached locally,
+never exposed through Traefik). Commands:
+
+  link init                        create data dir, DB, server keypair
+  link bootstrap --handle HANDLE   issue a single-use bootstrap token
+                                   (printed once; hand it to the agent's owner)
+  link revoke --handle HANDLE      revoke an identity (relay rejects its
+                                   messages at ingest from that moment)
+  link agents                      list registered identities
+  link status                      identity count, ledger states, server fp
+
+Options: --data-dir DIR (default $MUSELINK_DATA_DIR or ~/.muse-link-relay)
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import secrets
+import sqlite3
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "common"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gpgutil  # noqa: E402
+import server as relay_server  # noqa: E402
+
+
+def open_db(data_dir):
+    os.makedirs(data_dir, exist_ok=True)
+    db = sqlite3.connect(os.path.join(data_dir, "relay.db"))
+    db.row_factory = sqlite3.Row
+    db.executescript(relay_server.SCHEMA)
+    db.commit()
+    return db
+
+
+def cmd_init(args):
+    relay = relay_server.Relay(args.data_dir)
+    print(json.dumps({"status": "ok", "data_dir": args.data_dir,
+                      "server_fingerprint": relay.server_fp}))
+
+
+def cmd_bootstrap(args):
+    db = open_db(args.data_dir)
+    existing = db.execute("SELECT handle FROM identities WHERE handle=?",
+                          (args.handle,)).fetchone()
+    if existing:
+        print(json.dumps({"error": f"handle {args.handle} is already registered"}))
+        return 1
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    ttl = int(args.ttl_hours * 3600)
+    db.execute(
+        "INSERT INTO bootstrap_tokens (token_hash, handle, expires_at, created_at)"
+        " VALUES (?,?,?,?)",
+        (token_hash, args.handle, int(time.time()) + ttl, int(time.time())))
+    db.commit()
+    # The raw token is printed exactly once, here, for the operator to
+    # hand to the enrolling agent's owner. Only its hash is stored.
+    print(json.dumps({"status": "ok", "handle": args.handle,
+                      "bootstrap_token": token,
+                      "expires_in_hours": args.ttl_hours}))
+    return 0
+
+
+def cmd_revoke(args):
+    db = open_db(args.data_dir)
+    cur = db.execute(
+        "UPDATE identities SET status='revoked', revoked_at=? WHERE handle=? AND status='active'",
+        (int(time.time()), args.handle))
+    db.commit()
+    if cur.rowcount == 0:
+        print(json.dumps({"error": f"no active identity with handle {args.handle}"}))
+        return 1
+    print(json.dumps({"status": "ok", "revoked": args.handle}))
+    return 0
+
+
+def cmd_agents(args):
+    db = open_db(args.data_dir)
+    rows = db.execute(
+        "SELECT handle, agent_name, owner_name, platform, fingerprint, status, created_at"
+        " FROM identities ORDER BY handle").fetchall()
+    print(json.dumps({"agents": [dict(r) for r in rows]}, indent=2))
+    return 0
+
+
+def cmd_status(args):
+    relay = relay_server.Relay(args.data_dir)
+    print(json.dumps(relay.status(), indent=2))
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="link", description="Muse-Link operator CLI")
+    ap.add_argument("--data-dir", default=os.environ.get(
+        "MUSELINK_DATA_DIR", os.path.expanduser("~/.muse-link-relay")))
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("init")
+    b = sub.add_parser("bootstrap")
+    b.add_argument("--handle", required=True)
+    b.add_argument("--ttl-hours", type=float, default=24)
+    r = sub.add_parser("revoke")
+    r.add_argument("--handle", required=True)
+    sub.add_parser("agents")
+    sub.add_parser("status")
+    args = ap.parse_args()
+    return {
+        "init": cmd_init, "bootstrap": cmd_bootstrap, "revoke": cmd_revoke,
+        "agents": cmd_agents, "status": cmd_status,
+    }[args.cmd](args) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
